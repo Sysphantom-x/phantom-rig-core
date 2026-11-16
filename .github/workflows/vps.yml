@@ -1,0 +1,247 @@
+# Managed by rigctl 1.0.0 (rigctl-template: 1.0.0). `rigctl sync` overwrites local edits.
+#
+# Ephemeral Ubuntu VPS reachable only over your tailnet.
+#   * SSH is key-only (no passwords at all) and listens on the Tailscale IP only
+#   * the host key is pinned (secret SSH_HOST_KEY) so `rigctl ssh` verifies it strictly
+#   * Tailscale comes from its signed apt repository (no piping scripts into a shell)
+#   * secrets are passed via env (never interpolated into scripts, never printed)
+name: phantom-vps (ubuntu)
+run-name: "phantom-vps ${{ inputs.nonce }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        description: "Correlation id (set by rigctl)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner image label"
+        type: string
+        default: ubuntu-latest
+      keepalive:
+        description: "Auto-migrate to a fresh runner before the 6h limit"
+        type: boolean
+        default: false
+      max_chain:
+        description: "Maximum automatic migrations in one chain"
+        type: string
+        default: "3"
+      chain:
+        description: "Position in the keep-alive chain (internal)"
+        type: string
+        default: "0"
+      restore:
+        description: "Restore /root/workspace from the latest encrypted snapshot"
+        type: boolean
+        default: true
+      handoff_from:
+        description: "Predecessor run id for live state hand-off (internal)"
+        type: string
+        default: ""
+      web:
+        description: "Start the browser desktop bridge (xfce + noVNC) at boot"
+        type: boolean
+        default: false
+      packages:
+        description: "Extra apt packages, space separated"
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # encrypted workspace snapshots are stored as release assets
+  actions: write    # the keep-alive watchdog re-dispatches this workflow
+
+jobs:
+  vps:
+    name: ubuntu-vps
+    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    timeout-minutes: 350
+    env:
+      RIG_KIND: vps
+      RIG_OS: ubuntu
+      RIG_WORKFLOW: vps.yml
+      RIG_WORKSPACE: /root/workspace
+      RIG_HOSTNAME: phantom-vps-${{ github.run_id }}
+      RIG_RUNNER: ${{ inputs.runner }}
+      RIG_KEEPALIVE: ${{ inputs.keepalive }}
+      RIG_MAX_CHAIN: ${{ inputs.max_chain }}
+      RIG_CHAIN: ${{ inputs.chain }}
+      RIG_RESTORE: ${{ inputs.restore }}
+      RIG_HANDOFF_FROM: ${{ inputs.handoff_from }}
+      RIG_WEB: ${{ inputs.web }}
+      RIG_PACKAGES: ${{ inputs.packages }}
+      RIG_TIMEOUT_MIN: "350"
+      DEBIAN_FRONTEND: noninteractive
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Bootstrap rig agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "RIG_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/rig"
+          # The agent lives in this private repo; fetch it pinned to the exact commit being run.
+          curl -fsSL --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github.raw+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -o "$RUNNER_TEMP/rig/rig_agent.py" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/.rig/rig_agent.py?ref=$GITHUB_SHA"
+          echo "RIG_AGENT=$RUNNER_TEMP/rig/rig_agent.py" >> "$GITHUB_ENV"
+          sudo -E apt-get update -qq
+          sudo -E apt-get install -y -qq --no-install-recommends openssh-server python3-cryptography netcat-openbsd
+          python3 "$RUNNER_TEMP/rig/rig_agent.py" version
+
+      - name: Configure SSH (key-only, pinned host key)
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SSH_HOST_KEY: ${{ secrets.SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${SSH_PUBLIC_KEY:-}" ]]; then
+            echo "::error::SSH_PUBLIC_KEY secret is missing. Run: rigctl init"; exit 1
+          fi
+          key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+( .*)?$'
+          if [[ ! "$SSH_PUBLIC_KEY" =~ $key_re ]]; then
+            echo "::error::SSH_PUBLIC_KEY is not an OpenSSH public key"; exit 1
+          fi
+          sudo install -d -m 700 -o root -g root /root/.ssh "$RIG_WORKSPACE"
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo sh -c 'umask 077; cat > /root/.ssh/authorized_keys'
+          if [[ -n "${SSH_HOST_KEY:-}" ]]; then
+            printf '%s\n' "$SSH_HOST_KEY" | sudo sh -c 'umask 077; cat > /etc/ssh/ssh_host_ed25519_key'
+            sudo sh -c 'ssh-keygen -y -f /etc/ssh/ssh_host_ed25519_key > /etc/ssh/ssh_host_ed25519_key.pub'
+          fi
+          sudo tee /etc/ssh/sshd_config.d/00-rigctl.conf > /dev/null <<'EOF'
+          # Managed by rigctl: key-only root access over the tailnet.
+          HostKey /etc/ssh/ssh_host_ed25519_key
+          PermitRootLogin prohibit-password
+          PubkeyAuthentication yes
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          AuthenticationMethods publickey
+          PermitEmptyPasswords no
+          X11Forwarding no
+          MaxAuthTries 3
+          LoginGraceTime 20
+          ClientAliveInterval 30
+          ClientAliveCountMax 4
+          EOF
+          sudo sshd -t
+          # Ubuntu 24.04 socket-activates sshd, which ignores ListenAddress; use the plain service.
+          sudo systemctl disable --now ssh.socket 2>/dev/null || true
+          sudo systemctl enable ssh.service > /dev/null 2>&1
+          sudo systemctl restart ssh.service
+          echo "sshd: key-only auth, host key $(ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}')"
+
+      - name: Install Tailscale (signed apt repository)
+        run: |
+          set -euo pipefail
+          . /etc/os-release
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.noarmor.gpg" \
+            | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null
+          curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list > /dev/null
+          sudo -E apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/tailscale.list \
+            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+          sudo -E apt-get install -y -qq tailscale
+          sudo systemctl enable --now tailscaled
+          tailscale version | head -n 1
+
+      - name: Join tailnet
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_TAGS: ${{ vars.RIG_TS_TAGS }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${TS_AUTHKEY:-}" ]]; then
+            echo "::error::TAILSCALE_AUTH_KEY secret is missing. Run: rigctl init"; exit 1
+          fi
+          key="$TS_AUTHKEY"
+          extra=()
+          if [[ "$key" == tskey-client-* ]]; then
+            # OAuth client secret: mint an ephemeral, pre-approved, tagged node on the fly.
+            if [[ -z "${TS_TAGS:-}" ]]; then
+              echo "::error::OAuth client secrets need the repo variable RIG_TS_TAGS (e.g. tag:rig)"; exit 1
+            fi
+            key="${key}?ephemeral=true&preauthorized=true"
+          fi
+          if [[ -n "${TS_TAGS:-}" ]]; then extra+=("--advertise-tags=$TS_TAGS"); fi
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          chmod 600 "$keyfile"
+          printf '%s' "$key" > "$keyfile"
+          sudo tailscale up --auth-key="file:$keyfile" --hostname="$RIG_HOSTNAME" \
+            --reset --accept-dns=false --timeout=120s "${extra[@]}"
+          TAILSCALE_IP=""
+          for _ in $(seq 1 30); do
+            TAILSCALE_IP="$(sudo tailscale ip -4 2>/dev/null | head -n 1 || true)"
+            [[ -n "$TAILSCALE_IP" ]] && break
+            sleep 2
+          done
+          if [[ -z "$TAILSCALE_IP" ]]; then
+            echo "::error::Tailscale did not assign an IPv4 address"; exit 1
+          fi
+          echo "TAILSCALE_IP=$TAILSCALE_IP" >> "$GITHUB_ENV"
+          echo "Tailnet address: $TAILSCALE_IP ($RIG_HOSTNAME)"
+
+      - name: Bind SSH to the tailnet and verify
+        run: |
+          set -euo pipefail
+          echo "ListenAddress $TAILSCALE_IP" | sudo tee /etc/ssh/sshd_config.d/10-rigctl-listen.conf > /dev/null
+          sudo sshd -t
+          sudo systemctl restart ssh.service
+          for _ in $(seq 1 15); do
+            nc -z -w 2 "$TAILSCALE_IP" 22 && break
+            sleep 1
+          done
+          if ! nc -z -w 2 "$TAILSCALE_IP" 22; then
+            echo "::error::sshd is not reachable on $TAILSCALE_IP:22"; exit 1
+          fi
+          echo "SSH ready on $TAILSCALE_IP:22 (tailnet only)"
+
+      - name: Extra packages
+        run: |
+          set -euo pipefail
+          pkgs="$(echo "${RIG_PACKAGES:-}" | xargs)"
+          if [[ -z "$pkgs" ]]; then echo "no extra packages requested"; exit 0; fi
+          if [[ ! "$pkgs" =~ ^[a-z0-9.+:\ -]+$ ]]; then
+            echo "::error::packages contains invalid characters"; exit 1
+          fi
+          # Word splitting is intended here; the list was validated above.
+          # shellcheck disable=SC2086
+          sudo -E apt-get install -y -qq --no-install-recommends $pkgs
+
+      - name: Restore workspace
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RIG_AGENT_TOKEN: ${{ secrets.RIG_AGENT_TOKEN }}
+          RIG_STATE_KEY: ${{ secrets.RIG_STATE_KEY }}
+        run: sudo -E python3 "$RIG_AGENT" restore
+
+      - name: Browser desktop bridge
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: sudo -E python3 "$RIG_AGENT" web
+
+      - name: VPS online
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RIG_AGENT_TOKEN: ${{ secrets.RIG_AGENT_TOKEN }}
+          RIG_STATE_KEY: ${{ secrets.RIG_STATE_KEY }}
+        run: |
+          echo "=== phantom-vps ready ==="
+          echo "  address : $TAILSCALE_IP ($RIG_HOSTNAME)"
+          echo "  login   : root via SSH key only"
+          echo "  connect : rigctl ssh   |   rigctl web"
+          sudo -E python3 "$RIG_AGENT" serve
+
+      - name: Leave tailnet
+        if: ${{ always() }}
+        run: |
+          if command -v tailscale > /dev/null; then sudo tailscale logout || true; fi

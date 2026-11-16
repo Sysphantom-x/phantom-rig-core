@@ -1,0 +1,324 @@
+# Managed by rigctl 1.0.0 (rigctl-template: 1.0.0). `rigctl sync` overwrites local edits.
+#
+# Ephemeral Windows workstation reachable only over your tailnet.
+#   * no third-party scripts: every step is inline PowerShell, downloads are
+#     signature-verified (Authenticode) or checksum-verified (Chocolatey)
+#   * RDP keeps NLA + TLS on and only accepts connections from Tailscale addresses
+#   * secrets are passed via env (never interpolated into scripts, never printed)
+name: phantom-rig (windows)
+run-name: "phantom-rig ${{ inputs.nonce }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      nonce:
+        description: "Correlation id (set by rigctl)"
+        type: string
+        default: ""
+      runner:
+        description: "Runner image label"
+        type: string
+        default: windows-latest
+      rdp_user:
+        description: "Local RDP account name"
+        type: string
+        default: phantom
+      keepalive:
+        description: "Auto-migrate to a fresh runner before the 6h limit"
+        type: boolean
+        default: false
+      max_chain:
+        description: "Maximum automatic migrations in one chain"
+        type: string
+        default: "3"
+      chain:
+        description: "Position in the keep-alive chain (internal)"
+        type: string
+        default: "0"
+      restore:
+        description: "Restore C:\\Workspace from the latest encrypted snapshot"
+        type: boolean
+        default: true
+      handoff_from:
+        description: "Predecessor run id for live state hand-off (internal)"
+        type: string
+        default: ""
+      web:
+        description: "Start the browser desktop bridge at boot"
+        type: boolean
+        default: false
+      packages:
+        description: "Extra Chocolatey packages, space separated"
+        type: string
+        default: ""
+
+permissions:
+  contents: write   # encrypted workspace snapshots are stored as release assets
+  actions: write    # the keep-alive watchdog re-dispatches this workflow
+
+jobs:
+  rig:
+    name: windows-rig
+    runs-on: ${{ inputs.runner || 'windows-latest' }}
+    timeout-minutes: 350
+    env:
+      RIG_KIND: rig
+      RIG_OS: windows
+      RIG_WORKFLOW: rig.yml
+      RIG_WORKSPACE: 'C:\Workspace'
+      RIG_HOSTNAME: phantom-rig-${{ github.run_id }}
+      RIG_RDP_USER: ${{ inputs.rdp_user || 'phantom' }}
+      RIG_RUNNER: ${{ inputs.runner }}
+      RIG_KEEPALIVE: ${{ inputs.keepalive }}
+      RIG_MAX_CHAIN: ${{ inputs.max_chain }}
+      RIG_CHAIN: ${{ inputs.chain }}
+      RIG_RESTORE: ${{ inputs.restore }}
+      RIG_HANDOFF_FROM: ${{ inputs.handoff_from }}
+      RIG_WEB: ${{ inputs.web }}
+      RIG_PACKAGES: ${{ inputs.packages }}
+      RIG_TIMEOUT_MIN: "350"
+      TS_EXE: 'C:\Program Files\Tailscale\tailscale.exe'
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Bootstrap rig agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          Add-Content -Path $env:GITHUB_ENV -Value "RIG_STARTED_AT=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())"
+          $dir = Join-Path $env:RUNNER_TEMP 'rig'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          # The agent lives in this private repo; fetch it pinned to the exact commit being run.
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = 'application/vnd.github.raw+json'; 'X-GitHub-Api-Version' = '2022-11-28' }
+          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/contents/.rig/rig_agent.py?ref=$env:GITHUB_SHA"
+          Invoke-WebRequest -UseBasicParsing -Headers $headers -Uri $uri -OutFile (Join-Path $dir 'rig_agent.py')
+          Add-Content -Path $env:GITHUB_ENV -Value "RIG_AGENT=$(Join-Path $dir 'rig_agent.py')"
+          python --version
+          python -m pip install --disable-pip-version-check --quiet "cryptography>=42"
+          python (Join-Path $dir 'rig_agent.py') version
+
+      - name: Harden Remote Desktop (NLA + TLS, tailnet-only firewall)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Value 0 -Type DWord
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1 -Type DWord   # NLA required
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2 -Type DWord        # TLS only
+          Set-ItemProperty -Path "$ts\WinStations\RDP-Tcp" -Name MinEncryptionLevel -Value 3 -Type DWord   # high
+          # Never drop idle or disconnected sessions (the VM is gone in < 6h anyway).
+          $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          New-Item -Path $pol -Force | Out-Null
+          Set-ItemProperty -Path $pol -Name MaxIdleTime -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name MaxDisconnectionTime -Value 0 -Type DWord
+          Set-ItemProperty -Path $pol -Name fEnableTimeZoneRedirection -Value 1 -Type DWord
+          # Firewall: RDP + agent ports only from Tailscale address space (CGNAT v4 + ULA v6).
+          $tailnet = @('100.64.0.0/10', 'fd7a:115c:a1e0::/48')
+          Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Get-NetFirewallRule -DisplayName 'rigctl-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+          New-NetFirewallRule -DisplayName 'rigctl-rdp-tcp' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 -RemoteAddress $tailnet -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'rigctl-rdp-udp' -Direction Inbound -Action Allow -Protocol UDP -LocalPort 3389 -RemoteAddress $tailnet -Profile Any | Out-Null
+          New-NetFirewallRule -DisplayName 'rigctl-agent' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 7077,6080 -RemoteAddress $tailnet -Profile Any | Out-Null
+          # Anti-shutdown policy: hide Shut down / Restart from interactive users.
+          $exp = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+          New-Item -Path $exp -Force | Out-Null
+          Set-ItemProperty -Path $exp -Name NoClose -Value 1 -Type DWord
+          $sys = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+          Set-ItemProperty -Path $sys -Name shutdownwithoutlogon -Value 0 -Type DWord
+          Set-ItemProperty -Path $sys -Name EnableFirstLogonAnimation -Value 0 -Type DWord
+          Restart-Service -Name TermService -Force -ErrorAction Continue
+          Write-Host 'RDP hardened: NLA on, TLS on, port 3389 reachable from the tailnet only.'
+
+      - name: Create RDP account
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $user = $env:RIG_RDP_USER
+          if ($user -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,19}$') { throw "Invalid rdp_user '$user'" }
+          if ([string]::IsNullOrEmpty($env:RDP_PASSWORD)) { throw 'RDP_PASSWORD secret is missing. Run: rigctl init' }
+          $secure = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name $user -ErrorAction SilentlyContinue) {
+            Set-LocalUser -Name $user -Password $secure -PasswordNeverExpires $true
+          } else {
+            New-LocalUser -Name $user -Password $secure -FullName 'phantom rig' -Description 'rigctl RDP account' -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          }
+          foreach ($group in 'Administrators', 'Remote Desktop Users') {
+            if (-not (Get-LocalGroupMember -Group $group -Member $user -ErrorAction SilentlyContinue)) {
+              Add-LocalGroupMember -Group $group -Member $user
+            }
+          }
+          New-Item -ItemType Directory -Force -Path $env:RIG_WORKSPACE | Out-Null
+          Write-Host "RDP account '$user' is ready (password comes from the RDP_PASSWORD secret and is never printed)."
+
+      - name: Tune Windows for interactive use
+        continue-on-error: true
+        run: |
+          # Native equivalent of the usual "VM quick config" scripts.
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c   # High performance
+          powercfg /hibernate off
+          Get-ScheduledTask -TaskName 'ServerManager' -ErrorAction SilentlyContinue | Disable-ScheduledTask | Out-Null
+          New-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\ServerManager' -Name DoNotOpenServerManagerAtLogon -Value 1 -PropertyType DWord -Force | Out-Null
+          foreach ($id in '{A509B1A7-37EF-4b3f-8CFC-4F3A74704073}', '{A509B1A8-37EF-4b3f-8CFC-4F3A74704073}') {
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\$id" -Name IsInstalled -Value 0 -ErrorAction SilentlyContinue
+          }
+          $rel = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Reliability'
+          New-Item -Path $rel -Force | Out-Null
+          Set-ItemProperty -Path $rel -Name ShutdownReasonOn -Value 0 -Type DWord
+          foreach ($svc in 'Audiosrv', 'AudioEndpointBuilder') {
+            Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $svc -ErrorAction SilentlyContinue
+          }
+          foreach ($svc in 'WSearch', 'SysMain') {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          Add-MpPreference -ExclusionPath $env:RIG_WORKSPACE, 'C:\Tools' -ErrorAction SilentlyContinue
+          # Defaults for the RDP user's new profile: best-performance visuals, file extensions visible.
+          reg load 'HKU\RigDefault' 'C:\Users\Default\NTUSER.DAT' | Out-Null
+          reg add 'HKU\RigDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' /v VisualFXSetting /t REG_DWORD /d 2 /f | Out-Null
+          reg add 'HKU\RigDefault\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced' /v HideFileExt /t REG_DWORD /d 0 /f | Out-Null
+          reg add 'HKU\RigDefault\Control Panel\Desktop' /v MenuShowDelay /t REG_SZ /d 0 /f | Out-Null
+          [gc]::Collect()
+          reg unload 'HKU\RigDefault' | Out-Null
+          Write-Host 'Windows tuned for interactive use.'
+
+      - name: Install Tailscale (latest stable, signature-verified)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $index = Invoke-RestMethod -Uri 'https://pkgs.tailscale.com/stable/?mode=json'
+          $msi = $index.MSIs.amd64
+          if (-not $msi) { $msi = 'tailscale-setup-latest-amd64.msi' }
+          $path = Join-Path $env:RUNNER_TEMP $msi
+          Invoke-WebRequest -UseBasicParsing -Uri "https://pkgs.tailscale.com/stable/$msi" -OutFile $path
+          $sig = Get-AuthenticodeSignature -FilePath $path
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'Tailscale') {
+            throw "Tailscale MSI signature check failed: $($sig.Status) / $($sig.SignerCertificate.Subject)"
+          }
+          Write-Host "Installing $msi (signed by $($sig.SignerCertificate.Subject))"
+          $proc = Start-Process msiexec.exe -ArgumentList '/i', "`"$path`"", '/quiet', '/norestart', 'TS_UNATTENDEDMODE=always', 'TS_NOLAUNCH=true' -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "msiexec failed with exit code $($proc.ExitCode)" }
+          Remove-Item $path -Force
+          for ($i = 0; $i -lt 30 -and (Get-Service -Name Tailscale).Status -ne 'Running'; $i++) { Start-Sleep -Seconds 2 }
+          & $env:TS_EXE version
+
+      - name: Join tailnet
+        env:
+          TS_AUTHKEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_TAGS: ${{ vars.RIG_TS_TAGS }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrEmpty($env:TS_AUTHKEY)) { throw 'TAILSCALE_AUTH_KEY secret is missing. Run: rigctl init' }
+          $key = $env:TS_AUTHKEY
+          $extra = @()
+          if ($key.StartsWith('tskey-client-')) {
+            # OAuth client secret: mint an ephemeral, pre-approved, tagged node on the fly.
+            if ([string]::IsNullOrEmpty($env:TS_TAGS)) { throw 'OAuth client secrets need the repo variable RIG_TS_TAGS (e.g. tag:rig)' }
+            $key = $key + '?ephemeral=true&preauthorized=true'
+          }
+          if ($env:TS_TAGS) { $extra += "--advertise-tags=$env:TS_TAGS" }
+          $keyFile = Join-Path $env:RUNNER_TEMP 'ts-authkey'
+          [IO.File]::WriteAllText($keyFile, $key)
+          try {
+            & $env:TS_EXE up "--auth-key=file:$keyFile" "--hostname=$env:RIG_HOSTNAME" --unattended --reset --accept-dns=false --timeout=120s @extra
+            if ($LASTEXITCODE -ne 0) { throw "tailscale up failed with exit code $LASTEXITCODE" }
+          } finally {
+            Remove-Item $keyFile -Force -ErrorAction SilentlyContinue
+          }
+          $ip = $null
+          for ($i = 0; $i -lt 30 -and -not $ip; $i++) {
+            $ip = & $env:TS_EXE ip -4 2>$null | Select-Object -First 1
+            if (-not $ip) { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ip) { throw 'Tailscale did not assign an IPv4 address' }
+          Add-Content -Path $env:GITHUB_ENV -Value "TAILSCALE_IP=$ip"
+          Write-Host "Tailnet address: $ip ($env:RIG_HOSTNAME)"
+
+      - name: Verify RDP over the tailnet
+        run: |
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $result.TcpTestSucceeded) { throw "RDP is not reachable on ${env:TAILSCALE_IP}:3389" }
+          Write-Host "RDP listening on ${env:TAILSCALE_IP}:3389"
+
+      - name: Install apps (7-Zip, Telegram, extras)
+        continue-on-error: true
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $tools = 'C:\Tools'
+          New-Item -ItemType Directory -Force -Path $tools | Out-Null
+          $desktop = [Environment]::GetFolderPath('CommonDesktopDirectory')
+          function New-Shortcut([string]$Name, [string]$Target) {
+            $lnk = (New-Object -ComObject WScript.Shell).CreateShortcut((Join-Path $desktop "$Name.lnk"))
+            $lnk.TargetPath = $Target
+            $lnk.Save()
+          }
+          # Each app is isolated: one failed download never blocks the others.
+          try {
+            # 7-Zip: preinstalled on hosted images; Chocolatey (checksum-verified) only if missing.
+            $sevenZip = 'C:\Program Files\7-Zip\7zFM.exe'
+            if (-not (Test-Path $sevenZip)) { choco install 7zip -y --no-progress | Out-Null }
+            if (Test-Path $sevenZip) { New-Shortcut '7-Zip' $sevenZip; Write-Host '7-Zip ready' }
+          } catch { Write-Warning "7-Zip: $($_.Exception.Message)" }
+          try {
+            # Telegram Desktop: official portable build from telegram.org, Authenticode-verified.
+            $zip = Join-Path $env:RUNNER_TEMP 'telegram.zip'
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://telegram.org/dl/desktop/win64_portable' -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath $tools -Force
+            Remove-Item $zip -Force
+            $tg = Get-ChildItem -Path $tools -Recurse -Filter 'Telegram.exe' | Select-Object -First 1
+            if (-not $tg) { throw 'Telegram.exe not found in the archive' }
+            $sig = Get-AuthenticodeSignature -FilePath $tg.FullName
+            if ($sig.Status -eq 'Valid') {
+              icacls $tg.DirectoryName /grant 'Users:(OI)(CI)M' /T /C /Q | Out-Null
+              New-Shortcut 'Telegram' $tg.FullName
+              Write-Host "Telegram ready (signed by $($sig.SignerCertificate.Subject))"
+            } else {
+              Remove-Item -Recurse -Force $tg.DirectoryName
+              Write-Warning "Telegram signature is $($sig.Status); removed"
+            }
+          } catch { Write-Warning "Telegram: $($_.Exception.Message)" }
+          try {
+            # Extra packages requested at dispatch time.
+            $pkgs = "$env:RIG_PACKAGES".Trim()
+            if ($pkgs) {
+              if ($pkgs -notmatch '^[A-Za-z0-9._ -]+$') { throw 'packages contains invalid characters' }
+              choco install @($pkgs -split '\s+') -y --no-progress
+            }
+          } catch { Write-Warning "Extra packages: $($_.Exception.Message)" }
+          New-Shortcut 'Workspace' $env:RIG_WORKSPACE
+
+      - name: Restore workspace
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RIG_AGENT_TOKEN: ${{ secrets.RIG_AGENT_TOKEN }}
+          RIG_STATE_KEY: ${{ secrets.RIG_STATE_KEY }}
+        run: |
+          python $env:RIG_AGENT restore
+          icacls $env:RIG_WORKSPACE /grant "${env:RIG_RDP_USER}:(OI)(CI)M" /T /C /Q | Out-Null
+
+      - name: Browser desktop bridge
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python $env:RIG_AGENT web
+
+      - name: Rig online
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RIG_AGENT_TOKEN: ${{ secrets.RIG_AGENT_TOKEN }}
+          RIG_STATE_KEY: ${{ secrets.RIG_STATE_KEY }}
+        run: |
+          Write-Host "=== phantom-rig ready ==="
+          Write-Host "  address : $env:TAILSCALE_IP  ($env:RIG_HOSTNAME)"
+          Write-Host "  user    : $env:RIG_RDP_USER  (password: RDP_PASSWORD secret)"
+          Write-Host "  connect : rigctl connect   |   rigctl web"
+          python $env:RIG_AGENT serve
+
+      - name: Leave tailnet
+        if: ${{ always() }}
+        run: |
+          if (Test-Path $env:TS_EXE) { & $env:TS_EXE logout }
