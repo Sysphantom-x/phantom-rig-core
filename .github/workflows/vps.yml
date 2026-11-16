@@ -93,8 +93,8 @@ jobs:
             -o "$RUNNER_TEMP/rig/rig_agent.py" \
             "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/contents/.rig/rig_agent.py?ref=$GITHUB_SHA"
           echo "RIG_AGENT=$RUNNER_TEMP/rig/rig_agent.py" >> "$GITHUB_ENV"
-          sudo -E apt-get update -qq
-          sudo -E apt-get install -y -qq --no-install-recommends openssh-server python3-cryptography netcat-openbsd
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openssh-server python3-cryptography netcat-openbsd
           python3 "$RUNNER_TEMP/rig/rig_agent.py" version
 
       - name: Configure SSH (key-only, pinned host key)
@@ -146,9 +146,9 @@ jobs:
             | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null
           curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${VERSION_CODENAME}.tailscale-keyring.list" \
             | sudo tee /etc/apt/sources.list.d/tailscale.list > /dev/null
-          sudo -E apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/tailscale.list \
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get update -qq -o Dir::Etc::sourcelist=sources.list.d/tailscale.list \
             -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
-          sudo -E apt-get install -y -qq tailscale
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tailscale
           sudo systemctl enable --now tailscaled
           tailscale version | head -n 1
 
@@ -214,20 +214,20 @@ jobs:
           fi
           # Word splitting is intended here; the list was validated above.
           # shellcheck disable=SC2086
-          sudo -E apt-get install -y -qq --no-install-recommends $pkgs
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $pkgs
 
       - name: Restore workspace
         env:
           GITHUB_TOKEN: ${{ github.token }}
           RIG_AGENT_TOKEN: ${{ secrets.RIG_AGENT_TOKEN }}
           RIG_STATE_KEY: ${{ secrets.RIG_STATE_KEY }}
-        run: sudo -E python3 "$RIG_AGENT" restore
+        run: python3 "$RIG_AGENT" --as-root restore
 
       - name: Browser desktop bridge
         continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: sudo -E python3 "$RIG_AGENT" web
+        run: python3 "$RIG_AGENT" --as-root web
 
       - name: VPS online
         env:
@@ -239,7 +239,7 @@ jobs:
           echo "  address : $TAILSCALE_IP ($RIG_HOSTNAME)"
           echo "  login   : root via SSH key only"
           echo "  connect : rigctl ssh   |   rigctl web"
-          sudo -E python3 "$RIG_AGENT" serve
+          python3 "$RIG_AGENT" --as-root serve
 
       - name: Leave tailnet
         if: ${{ always() }}

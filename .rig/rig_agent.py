@@ -1360,8 +1360,51 @@ def cmd_web(cfg: AgentConfig, force: bool = False) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------- #
+# Privilege elevation without `sudo -E`
+#
+# Ubuntu 26.04 ships sudo-rs, which ignores `sudo -E`, so secrets passed via the
+# step's env never reached the root process. Instead the relevant variables go
+# through a 0600 file that the elevated process deletes as soon as it has read it.
+# --------------------------------------------------------------------------- #
+FORWARD_PREFIXES = ("RIG_", "GITHUB_")
+FORWARD_KEYS = ("TAILSCALE_IP",)
+
+
+def forwarded_env(env: Dict[str, str]) -> Dict[str, str]:
+    return {k: v for k, v in env.items() if k.startswith(FORWARD_PREFIXES) or k in FORWARD_KEYS}
+
+
+def load_env_file(path: str) -> None:
+    try:
+        with open(path, encoding="utf-8") as fh:
+            os.environ.update({str(k): str(v) for k, v in json.load(fh).items()})
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def elevate(argv: List[str], call: Callable[[List[str]], int] = subprocess.call) -> int:
+    fd, path = tempfile.mkstemp(prefix="rig-env-", suffix=".json", dir=os.environ.get("RUNNER_TEMP") or None)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:  # mkstemp → mode 0600
+            json.dump(forwarded_env(dict(os.environ)), fh)
+        script = os.path.abspath(__file__)
+        return call(["sudo", "-n", sys.executable, script, "--env-file", path, *argv])
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(prog="rig_agent", description=__doc__.splitlines()[0])
+    parser.add_argument("--as-root", action="store_true", help="re-run as root via sudo, forwarding RIG_*/GITHUB_* env")
+    parser.add_argument("--env-file", help=argparse.SUPPRESS)
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve", help="run the control API + keep-alive watchdog (blocks)")
     sub.add_parser("restore", help="restore the workspace (live handoff, then latest snapshot)")
@@ -1370,6 +1413,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     web.add_argument("--force", action="store_true")
     sub.add_parser("version")
     args = parser.parse_args(argv)
+    if args.env_file:
+        load_env_file(args.env_file)
+    if args.as_root and hasattr(os, "geteuid") and os.geteuid() != 0:
+        return elevate([a for a in argv if a != "--as-root"])
     cfg = AgentConfig.from_env()
     if args.cmd == "version":
         print(AGENT_VERSION)
